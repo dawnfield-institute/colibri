@@ -24,6 +24,7 @@ p.add_argument("--batch", type=int, default=2)
 p.add_argument("--seq", type=int, default=512)
 p.add_argument("--lr", type=float, default=5e-4)
 p.add_argument("--out", required=True)
+p.add_argument("--corpus", choices=["wikitext", "fineweb"], default="fineweb")
 p.add_argument("--objective", choices=["token", "usage"], default="usage",
                help="'usage' = minimize aggregate-usage entropy (anti-load-balancing; the "
                     "cache-relevant concentration). 'token' = round-1 per-token objective.")

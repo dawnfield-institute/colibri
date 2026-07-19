@@ -93,3 +93,11 @@ corrected objective is its sign-flip: **the anti-load-balancing loss.**
 **Round 2 (launched): usage-entropy objective** (α∈{0.5, 2.0}) + **α=0 control** to price
 the pure domain-shift cost. Trainer logs both entropies (Htok, Huse) to keep the
 distinction measurable.
+
+**Round 2 (2026-07-19): MECHANISM PROVEN, window not yet found.** Usage objective at
+α=2.0: batch-usage entropy 4.16→3.47 and **hit@16 53.9%→64.5% (+10.6pp)** — the first
+direct demonstration that streaming-cache hit rate is trainable. Cost at that dose: ppl
+6.38→41.7 (unacceptable). α=0.5 = dead zone (ppl 9.29, no concentration). The α=0
+control prices pure wikitext domain-shift at +0.66 ppl — a recoverable corpus artifact,
+not an objective cost. Round 3: fineweb corpus (eval-adjacent distribution) ×
+{α=1.0/lr 5e-4, α=2.0/lr 2e-4} — dose retained, gradient gentler, corpus fixed.
