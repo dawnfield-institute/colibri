@@ -101,3 +101,15 @@ direct demonstration that streaming-cache hit rate is trainable. Cost at that do
 control prices pure wikitext domain-shift at +0.66 ppl — a recoverable corpus artifact,
 not an objective cost. Round 3: fineweb corpus (eval-adjacent distribution) ×
 {α=1.0/lr 5e-4, α=2.0/lr 2e-4} — dose retained, gradient gentler, corpus fixed.
+
+**Round 3 (2026-07-19): gentler dosing loses the effect.** fineweb + {α=1.0/lr 5e-4,
+α=2.0/lr 2e-4}: Huse only reached ~3.9 (vs round-2's 3.47), hit gains evaporated
+(+0.3–0.8pp) while ppl still paid 10.4–14.9. Verdict across rounds: **the global
+usage-entropy objective has a bad Pareto slope** — it spends LM quality on concentration
+everywhere instead of where the cache collects it. Two sharper successors identified:
+(a) **top-k-mass objective** — directly maximize the usage mass carried by each layer's
+top-16 experts (the literal quantity hit@16 measures; differentiable via topk-sum);
+(b) **KL-anchored sharpening** — concentrate while penalizing divergence from the
+original routing (the GLM offline-distillation formulation brought forward to OLMoE).
+E1 status: mechanism proven (round 2), pre-registered bar not yet reached; next round
+awaits objective redesign review.
