@@ -33,7 +33,9 @@ typedef struct {
  * Ogni weight [out,in] tenuto come int8 (per-riga) + scala float per riga.
  * Cosi' la RAM-cache scende da 4 byte/param (f32) a 1 byte/param: e' il
  * meccanismo che fa stare GLM-5.2 nei 15 GB. dequant-on-use nel matmul. */
-typedef struct { int eid; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
+typedef struct { int eid; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used;
+                 float score; uint64_t last_t; /* LRFU (CACHE_POLICY=phi): decayed hit score + last tick */
+                 uint64_t ptok;                /* last token this slot was probed (tokaware protection) */ } Slot;
 typedef struct { Slot *slots; int n, cap; } LCache;
 
 typedef struct {
@@ -57,6 +59,23 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }        /* Linux: KB */
 #endif
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+
+/* ---- experiment knobs (env; every one inert when unset) ----
+ * ROUTE_TRACE=path   dump per (token,layer): router entropy + top-k (eid,weight) pairs
+ * TOPK=n             runtime top-k override (n < config topk): routing-mass truncation A/B
+ * CACHE_POLICY=phi   LRFU eviction (decayed hit frequency) instead of LRU
+ * PHI_LAMBDA=x       LRFU decay per decode step (default 0.618); x=1.0 degenerates to LFU */
+static FILE *g_trace = NULL;
+static int g_topk_ovr = 0;
+static int g_pol_phi = 0;
+static float g_lambda = 0.618f;
+static uint64_t g_tok = 0;        /* decode-step counter: time base for the LRFU decay */
+static int g_pos_base = 0;        /* absolute position of the current step's first token */
+/* CACHE_POLICY=tokaware: protect the PREVIOUS token's fired experts from eviction until
+ * they have been re-probed this token — they have a measured ~43% chance of firing again
+ * (lag-1 overlap), but plain LRU evicts them mid-token before their probe arrives. */
+static int g_pol_tok = 0;
+static uint8_t g_prev_fired[64][64], g_cur_fired[64][64];   /* [layer][eid]; OLMoE: 16x64 */
 
 /* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
@@ -233,8 +252,13 @@ static void load_expert_w(Model *m, const char *name, int8_t *q, float *scale, i
 /* ---------- cache expert: ritorna i pesi quantizzati (q+scale) da cache o disco ---------- */
 static void expert_get(Model *m, int layer, int eid, Slot **out) {
     LCache *lc = &m->cache[layer];
+    if (g_pol_tok && layer < 64 && eid < 64) g_cur_fired[layer][eid] = 1;
     for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
-        m->hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i]; return;
+        m->hits++; lc->slots[i].used = ++m->clock; lc->slots[i].ptok = g_tok;
+        if (g_pol_phi) { Slot *sl = &lc->slots[i];
+            sl->score = sl->score * powf(g_lambda, (float)(g_tok - sl->last_t)) + 1.0f;
+            sl->last_t = g_tok; }
+        *out = &lc->slots[i]; return;
     }
     m->miss++;
     Cfg *c = &m->c;
@@ -244,6 +268,24 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         s = &lc->slots[lc->n++];
         s->g = malloc(ng); s->u = malloc(ng); s->d = malloc(nd);
         s->gs = falloc(c->inter); s->us = falloc(c->inter); s->ds = falloc(c->hidden);
+    } else if (g_pol_tok) {       /* token-aware LRU: skip prev-token experts not yet re-probed */
+        int v = -1;
+        for (int i = 0; i < lc->n; i++) {
+            int prot = lc->slots[i].eid < 64 && g_prev_fired[layer][lc->slots[i].eid]
+                       && lc->slots[i].ptok < g_tok;
+            if (prot) continue;
+            if (v < 0 || lc->slots[i].used < lc->slots[v].used) v = i;
+        }
+        if (v < 0) { v = 0; for (int i = 1; i < lc->n; i++)          /* all protected: plain LRU */
+                         if (lc->slots[i].used < lc->slots[v].used) v = i; }
+        s = &lc->slots[v];
+    } else if (g_pol_phi) {       /* LRFU: evict the lowest decayed-frequency score */
+        int v = 0; float bv = 1e30f;
+        for (int i = 0; i < lc->n; i++) {
+            float sc = lc->slots[i].score * powf(g_lambda, (float)(g_tok - lc->slots[i].last_t));
+            if (sc < bv) { bv = sc; v = i; }
+        }
+        s = &lc->slots[v];
     } else { int lru = 0; for (int i = 1; i < lc->n; i++) if (lc->slots[i].used < lc->slots[lru].used) lru = i; s = &lc->slots[lru]; }
     float *tmp = falloc(ng > nd ? ng : nd);
     char nm[256];
@@ -252,6 +294,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.down_proj.weight",layer,eid); load_expert_w(m,nm,s->d,s->ds,c->hidden,c->inter,tmp);
     free(tmp);
     s->eid = eid; s->used = ++m->clock;
+    s->score = 1.0f; s->last_t = g_tok;
     *out = s;
 }
 
@@ -319,6 +362,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
 /* MoE sui token x[S,hidden] -> out[S,hidden] */
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
+    if (g_topk_ovr > 0 && g_topk_ovr < K) K = g_topk_ovr;
     float *logits = falloc((int64_t)S*E);
     matmul(logits, x, l->gate, S, D, E);
     memset(out, 0, (int64_t)S*D*sizeof(float));
@@ -336,7 +380,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
             idx[kk] = best; val[kk] = bv;
         }
-        if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
+        if (c->norm_topk || (g_topk_ovr && getenv("TOPK_NORM")))
+            { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
+        if (g_trace) {                            /* router entropy over ALL E + the k selected (eid,weight) */
+            float H = 0; for (int e = 0; e < E; e++) if (pr[e] > 1e-12f) H -= pr[e] * logf(pr[e]);
+            fprintf(g_trace, "%d,%d,%.4f", g_pos_base + s, layer, H);
+            for (int kk = 0; kk < K; kk++) fprintf(g_trace, ",%d,%.5f", idx[kk], val[kk]);
+            fputc('\n', g_trace);
+        }
         const float *xs = x + (int64_t)s*D;
         for (int kk = 0; kk < K; kk++) {
             Slot *e; expert_get(m, layer, idx[kk], &e);
@@ -355,6 +406,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
 /* un passo: token nuovi ids[S] a posizione pos_base. Ritorna logits dell'ultimo token (malloc'd). */
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
+    g_tok++; g_pos_base = pos_base;
+    if (g_pol_tok) { memcpy(g_prev_fired, g_cur_fired, sizeof(g_cur_fired));
+                     memset(g_cur_fired, 0, sizeof(g_cur_fired)); }
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
@@ -400,6 +454,35 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     }
 }
 
+/* teacher-forced NLL of full_ids[np..nfull): feed the REFERENCE token at each step
+ * (never the argmax), accumulate -log softmax(logits)[next_ref]. The loss meter for
+ * every throughput experiment: same engine path as decode, so hit rate/speed stay
+ * comparable, but quality is measured as perplexity instead of exact-match. PPL=1. */
+static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
+    Cfg *c = &m->c;
+    m->max_t = nfull;
+    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    for (int i = 0; i < c->n_layers; i++) {
+        m->K[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+        m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+    }
+    double nll = 0; int scored = 0;
+    float *logit = step(m, full, np, 0);              /* prefill on the prompt */
+    for (int i = np; i < nfull; i++) {
+        /* log softmax(logit)[full[i]] without materializing the softmax */
+        float mx = logit[0]; for (int v = 1; v < c->vocab; v++) if (logit[v] > mx) mx = logit[v];
+        double Z = 0; for (int v = 0; v < c->vocab; v++) Z += exp((double)logit[v] - mx);
+        nll += -((double)logit[full[i]] - mx - log(Z));
+        scored++;
+        free(logit); logit = NULL;
+        if (i == nfull - 1) break;
+        logit = step(m, &full[i], 1, i);              /* teacher forcing */
+    }
+    if (logit) free(logit);
+    *nll_out = nll / scored;
+    return scored;
+}
+
 /* ---------- lettura ref.json ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -419,6 +502,19 @@ int main(int argc, char **argv) {
     }
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
 
+    { const char *e;
+      if ((e = getenv("ROUTE_TRACE")) && *e) { g_trace = fopen(e, "w");
+          if (g_trace) fprintf(g_trace, "tok,layer,entropy,eid_w_pairs...\n"); }
+      if ((e = getenv("TOPK")))        g_topk_ovr = atoi(e);
+      if ((e = getenv("CACHE_POLICY")) && !strcmp(e, "phi")) g_pol_phi = 1;
+      if ((e = getenv("CACHE_POLICY")) && !strcmp(e, "tokaware")) g_pol_tok = 1;
+      if ((e = getenv("PHI_LAMBDA")))  g_lambda = (float)atof(e);
+      if (g_topk_ovr || g_pol_phi || g_pol_tok || g_trace)
+          printf("[experiment] topk_override=%d cache_policy=%s lambda=%.3f trace=%s\n",
+                 g_topk_ovr, g_pol_tok ? "tokaware" : (g_pol_phi ? "phi-LRFU" : "lru"), g_lambda,
+                 g_trace ? getenv("ROUTE_TRACE") : "off");
+    }
+
     FILE *f = fopen(refpath, "rb"); if(!f){perror(refpath);return 1;}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *buf=malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
@@ -429,6 +525,20 @@ int main(int argc, char **argv) {
     printf("== Streaming C engine, cache = %d experts/layer, experts @ %d-bit ==\n", cap, bits);
     Model m; model_init(&m, snap, cap, bits);
     printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+
+    if (getenv("PPL") && atoi(getenv("PPL")) == 1) {   /* loss-meter mode: teacher-forced NLL */
+        double nll; double t = now_s();
+        int scored = tf_nll(&m, full, nfull, np, &nll);
+        double dt = now_s() - t;
+        double tot = m.hits + m.miss;
+        printf("TF-NLL: %.4f nats/token over %d tokens  |  ppl = %.2f\n", nll, scored, exp(nll));
+        printf("Expert cache hit rate: %.1f%%  (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
+               (unsigned long long)m.hits, (unsigned long long)m.miss);
+        printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
+        free(buf); free(arena);
+        if (g_trace) fclose(g_trace);
+        return 0;
+    }
 
     int *out = malloc((np + n_new) * sizeof(int));
     double t = now_s();
@@ -445,5 +555,6 @@ int main(int argc, char **argv) {
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     printf("Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
     free(buf); free(arena);
+    if (g_trace) fclose(g_trace);
     return 0;
 }
