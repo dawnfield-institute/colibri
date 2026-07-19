@@ -75,3 +75,21 @@ n≥400 tokens); expert starvation on rare domains (keep original routers for fa
 Not full fine-tuning, not quantization-aware training, not architecture change. Smallest
 intervention, biggest boundary-mover, every step measured against pre-registered criteria
 with the loss meter that already caught one catastrophic "improvement."
+
+---
+
+## E1 log (running record)
+
+**Round 1 (2026-07-19): FAIL, informative.** Per-token entropy objective, α∈{0.02,0.05,0.2},
+300 steps, wikitext-2. All three worsened both axes (ppl 6.77–7.20 vs bar ≤6.51; hit
+51.8–52.6% vs bar ≥68.9%; baseline 6.38/53.9%). Two causes identified: (1) domain shift —
+gates adapted to wikitext (lm 2.70→2.22) and moved away from the eval distribution;
+(2) **objective flaw — per-token entropy is the wrong concentration.** Sharpening each
+token's mix doesn't make tokens *share* experts; aggregate usage stays flat and the cache
+gains nothing. The cache-relevant quantity is the entropy of the **batch-mean routing
+distribution** — exactly what the standard MoE load-balancing aux loss maximizes. The
+corrected objective is its sign-flip: **the anti-load-balancing loss.**
+
+**Round 2 (launched): usage-entropy objective** (α∈{0.5, 2.0}) + **α=0 control** to price
+the pure domain-shift cost. Trainer logs both entropies (Htok, Huse) to keep the
+distinction measurable.
