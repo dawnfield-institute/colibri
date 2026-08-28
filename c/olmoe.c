@@ -81,7 +81,9 @@ typedef struct {
 /* pinned=1 means this slot is strongly preferred to keep (hot expert); it will
  * not be evicted during normal LRU eviction, but may be displaced under extreme
  * cache pressure when all slots are pinned or in-flight. */
-typedef struct { int eid; int pinned; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
+typedef struct { int eid; int pinned; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used;
+                 float score; uint64_t last_step; /* CACHE_POLICY=phi only: decayed hit score,
+                                                   * and the decode step it was last decayed to */ } Slot;
 typedef struct {
     Slot *slots;
     int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
@@ -126,6 +128,49 @@ static int g_fused3 = 0;            /* FUSED3=1: AVX2 activation quant + gate/up
                                      * (fused_simd.h: quant_x_q8_avx2, matmul_q_idot_v3,
                                      * matmul_q_idot_pair_v3). Exact integer arithmetic only —
                                      * bit-identical to the stock matmul_q path; OFF by default. */
+/* CACHE_POLICY=phi: evict by decayed hit frequency (LRFU) instead of by recency (LRU).
+ * A slot's score decays by PHI_LAMBDA once per DECODE STEP -- not per access, which is
+ * what makes it a frequency measure rather than a slower clock: an expert that fires
+ * twice in one step is twice as hot, an expert that has not fired for ten steps has
+ * decayed ten times whatever it did while resident.
+ *
+ * The default 0.618 is 1/phi, carried over from the July OLMoE run where the question
+ * was whether a decay constant taken from the physics work beats an arbitrary one. The
+ * honest answer there was "only when starved": +2-4pp hit rate at cap 8, a tie at sane
+ * caps, because at cap >= 2K plain LRU already holds the working set. PHI_LAMBDA=1.0
+ * degenerates to pure LFU, and unset leaves LRU untouched -- the knob is inert by
+ * default and the A/B is the point of it, not the constant. */
+static int   g_pol_phi = 0;
+static float g_phi_lambda = 0.618f;
+static uint64_t g_step = 0;         /* decode steps, the LRFU decay time base */
+
+/* Decay lazily on read rather than sweeping every slot each step: a slot's score is
+ * only ever compared, so bringing it forward to the current step at comparison time
+ * gives the same ordering for O(resident) work instead of O(experts) per step. */
+static float phi_score(const Slot *s) {
+    return s->score * powf(g_phi_lambda, (float)(g_step - s->last_step));
+}
+static void phi_touch(Slot *s) {
+    s->score = phi_score(s) + 1.0f;
+    s->last_step = g_step;
+}
+
+/* Coldest evictable slot, or -1 when every slot is pinned or in flight. Both eviction
+ * sites (demand load and PILOT prefetch) select through here so a policy cannot apply
+ * to one path and not the other; they differ in what they do with -1, not in how they
+ * choose. The ordering key is the only thing CACHE_POLICY changes -- the pinned and
+ * in-flight skips are correctness, not policy, and hold for every policy. */
+static int evict_pick(LCache *lc) {
+    int v = -1;
+    for (int i = 0; i < lc->n; i++) {
+        if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
+        if (v < 0) { v = i; continue; }
+        int colder = g_pol_phi ? (phi_score(&lc->slots[i]) < phi_score(&lc->slots[v]))
+                               : (lc->slots[i].used < lc->slots[v].used);
+        if (colder) v = i;
+    }
+    return v;
+}
 
 static uint64_t lfru_score(uint32_t heat, uint64_t last, uint64_t clock) {
     uint64_t age = (clock > last) ? (clock - last) : 0;
@@ -174,6 +219,12 @@ static void cache_publish(Model *m, int layer, Slot *s, int eid) {
     LCache *lc = &m->cache[layer];
     cache_unindex(m, layer, s);
     s->eid = eid;
+    /* A newly resident expert starts at one hit, this step. Both load paths (demand
+     * and PILOT prefetch) publish through here, so neither can leave a slot carrying
+     * the decayed score of the tenant it evicted -- which would let a cold arrival
+     * inherit a warm slot's protection from the next eviction. Costs two stores when
+     * CACHE_POLICY is unset and nothing reads them. */
+    s->score = 1.0f; s->last_step = g_step;
     if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts)
         lc->slot_by_expert[eid] = (int)(s - lc->slots);
 }
@@ -573,6 +624,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     Slot *hit = slot_indexed(m, layer, eid);
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
+        if (g_pol_phi) phi_touch(hit);
         if (m->last_access) m->last_access[layer * m->c.n_experts + eid] = m->clock;
         pthread_mutex_unlock(&g_pilot_mx);
         return;
@@ -584,12 +636,8 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
-            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-        }
+        /* Coldest evictable slot; CACHE_POLICY decides what "coldest" means. */
+        int lru = evict_pick(lc);
         if (lru < 0) {
             /* All slots are pinned or in-flight; find oldest non-in-flight slot
              * (may be pinned, but never select one currently being loaded). */
@@ -627,6 +675,10 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     cache_publish(m, layer, s, eid);
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
+    /* A freshly loaded expert starts at one hit, this step -- not at whatever the
+     * evicted tenant's decayed score happened to be, which would let a cold arrival
+     * inherit a warm slot's protection. */
+    s->score = 1.0f; s->last_step = g_step;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     *out = s;
     pthread_mutex_unlock(&g_pilot_mx);
@@ -807,6 +859,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             idx[kk] = best; val[kk] = pr[best];
         }
         if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
+        /* ROUTE_TRACE: emit after normalisation, so the gates on the line are the ones
+         * the layer actually applies. olmoe already keeps the usage counters this file
+         * feeds by hand below, but it never emitted the per-token stream, so nothing
+         * downstream of it (tools/route_pairs.py, the .coli_pairs pipeline, any lag-k or
+         * co-fire analysis) could read this engine -- the smallest MoE in the tree was
+         * the one you could not watch route. Inert unless ROUTE_TRACE is set. */
+        rt_trace(layer, s, idx, val, K);
         /* IMPROVEMENT 2: update activation heatmap (before pinning activates) */
         if (!m->hot_pinned && m->freq) {
             uint32_t *freq_l = m->freq[layer];
@@ -839,6 +898,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int d = 0; d < D; d++) os[d] += w * hh[d];
         }
     }
+    rt_trace_end();          /* advance the call counter once per moe(), after its rows */
     free(logits); free(g); free(u); free(hh);
 }
 
@@ -873,6 +933,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
+    g_step++;      /* one tick per forward, the LRFU decay's time base (CACHE_POLICY=phi) */
     if (g_pilot && m->token_count > 0) {
         /* Flush stale prefetch requests: clear is_queued so pilot_realload
          * will skip any entries still sitting in pilot_q for the previous
@@ -921,12 +982,8 @@ static void pilot_realload(Model *m, int layer, int eid) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
-            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-        }
+        /* Coldest evictable slot; CACHE_POLICY decides what "coldest" means. */
+        int lru = evict_pick(lc);
         if (lru < 0) {
             m->is_queued[layer * c->n_experts + eid] = 0;
             pthread_mutex_unlock(&g_pilot_mx);
@@ -1473,6 +1530,14 @@ int main(int argc, char **argv) {
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
     g_fused3     = getenv("FUSED3") ? atoi(getenv("FUSED3")) : 0;
+    { const char *cp = getenv("CACHE_POLICY");
+      g_pol_phi = (cp && !strcmp(cp, "phi"));
+      if (cp && !g_pol_phi && strcmp(cp, "lru"))
+          fprintf(stderr, "CACHE_POLICY=%s is not a policy (lru|phi) — using lru\n", cp);
+      if (getenv("PHI_LAMBDA")) g_phi_lambda = (float)atof(getenv("PHI_LAMBDA"));
+      if (!(g_phi_lambda > 0.f && g_phi_lambda <= 1.f)) {
+          fprintf(stderr, "PHI_LAMBDA must be in (0,1] (got %g) — using 0.618\n", (double)g_phi_lambda);
+          g_phi_lambda = 0.618f; } }
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
     int hot_n  = getenv("HOT")   ? atoi(getenv("HOT"))   : 0;
