@@ -4,6 +4,15 @@ export interface ChatMessage {
   id: string
   role: ChatRole
   content: string
+  /* Immagini allegate al turno, come data: URI. Restano sul messaggio e non
+     dentro `content` perche' la cronologia le deve poter rimandare al server
+     insieme al testo: un secondo turno che parla della foto senza la foto
+     riceverebbe una risposta su niente. */
+  images?: string[]
+  /* Reasoning models stream their thinking on a separate delta field before
+     the answer. Kept apart from `content` so it can be rendered as its own
+     block and excluded from what is sent back as conversation history. */
+  reasoning?: string
 }
 
 interface OpenAIError {
@@ -47,6 +56,23 @@ export interface HealthResponse {
   kv_slots?: number
   tiers?: TiersHealth
   hwinfo?: HwinfoHealth
+}
+
+export interface ProfileTurn {
+  wall_s: number
+  prompt_tokens: number
+  completion_tokens: number
+  expert_disk_s: number
+  expert_wait_s: number
+  expert_matmul_s: number
+  attention_s: number
+  lm_head_s: number
+  forwards: number
+}
+
+export interface ProfileResponse {
+  seq: number
+  turns: ProfileTurn[]
 }
 
 export interface TokenUsage {
@@ -100,6 +126,12 @@ export async function getHealth(baseUrl: string, apiKey = "", signal?: AbortSign
   return (await response.json()) as HealthResponse
 }
 
+export async function getProfile(baseUrl: string, apiKey = "", signal?: AbortSignal): Promise<ProfileResponse> {
+  const response = await fetch(serverEndpoint(baseUrl, "profile"), { headers: headers(apiKey), signal })
+  if (!response.ok) throw new Error(await responseError(response))
+  return (await response.json()) as ProfileResponse
+}
+
 export function extractSSE(buffer: string) {
   const frames = buffer.split(/\r?\n\r?\n/)
   const rest = frames.pop() || ""
@@ -123,6 +155,7 @@ export interface StreamChatOptions {
   cacheSlot?: number
   signal: AbortSignal
   onDelta: (text: string) => void
+  onReasoning?: (text: string) => void
 }
 
 export async function streamChat(options: StreamChatOptions): Promise<StreamChatResult> {
@@ -132,7 +165,19 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     signal: options.signal,
     body: JSON.stringify({
       model: options.model,
-      messages: options.messages.map(({ role, content }) => ({ role, content })),
+      /* Un turno con immagini viaggia nella forma a parti dell'API OpenAI;
+         senza, resta la stringa di sempre e nessun server vede una differenza. */
+      messages: options.messages.map(({ role, content, images }) =>
+        images && images.length
+          ? {
+              role,
+              content: [
+                ...(content ? [{ type: "text", text: content }] : []),
+                ...images.map((url) => ({ type: "image_url", image_url: { url } })),
+              ],
+            }
+          : { role, content },
+      ),
       temperature: options.temperature,
       max_completion_tokens: options.maxTokens,
       enable_thinking: options.enableThinking,
@@ -153,12 +198,14 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   const consume = (data: string) => {
     if (data === "[DONE]") return
     const event = JSON.parse(data) as {
-      choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }>
+      choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>
       usage?: TokenUsage | null
     }
     const choice = event.choices?.[0]
     const text = choice?.delta?.content
     if (text) options.onDelta(text)
+    const reasoning = choice?.delta?.reasoning_content
+    if (reasoning) options.onReasoning?.(reasoning)
     if (choice?.finish_reason) finishReason = choice.finish_reason
     if (event.usage) usage = event.usage
   }
