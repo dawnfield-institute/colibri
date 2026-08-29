@@ -69,17 +69,39 @@ dose-response: `HOT=8` at cap 32 pins only a quarter of the cache and is already
 (slightly) worse, and the degradation is smooth rather than a cliff at
 `HOT`=cap.
 
-**"Qwen3.6's routing is flat, so there is no hot set to pin."** Refuted by
-measuring it — which this branch's `ROUTE_TRACE` wiring is what makes possible.
-Per-layer, averaged over 40 layers and 19520 routes:
+**"Qwen3.6's routing is flat, so there is no hot set to pin."** Refuted, but the
+first version of this refutation was wrong in a way worth keeping on the record.
 
-| | top-10% of experts | top-26% | top-50% |
-|---|---|---|---|
-| share of routes | **62.8%** | **90.0%** | 99.2% |
+The raw statistic on this trace is that the top 26% of experts catch **90.0%** of
+routes, against July's 47.6% for OLMoE and 69.5% for GLM-5.2 — which reads as a
+tidy ladder with Qwen3.6 the most skewed of the three. **Most of that is the
+trace being short.** Concentration is biased upward by thin sampling: when there
+are fewer observed routes than experts, most experts simply have not been seen,
+and the ones that have hold all the mass. This trace is 19520 routes over 40
+layers and 256 experts — 1.9 routes per expert per layer. A *uniform random*
+router, sampled that thinly, scores 50.0% on the same measure.
 
-with 105 of 256 experts firing per layer on average. For comparison, the July
-numbers: OLMoE 47.6% at top-26% (flat — aux-loss load balancing), GLM-5.2
-69.5%. **Qwen3.6 is the most skewed of the three.** A hot set very much exists.
+Against that null (`tools/analyze_route_skew.py`):
+
+| rows | routes/expert/layer | measured | uniform null | excess |
+|---|---|---|---|---|
+| 610 | 0.48 | 99.0% | 74.5% | +24.6pp |
+| 1220 | 0.95 | 95.5% | 62.2% | +33.3pp |
+| 2440 | 1.91 | **90.0%** | **50.0%** | **+39.9pp** |
+
+Two things follow. **The refutation stands**: +39.9pp over the null is a large,
+unambiguous excess, so routing is emphatically not flat and a hot set exists.
+**The ladder does not**: the three raw numbers were taken at wildly different
+sample densities — OLMoE's July trace runs 30 routes per expert per layer, 16×
+this one — so comparing them compares trace lengths. Re-measured against the null
+at roughly matched density, OLMoE shows +14.5pp at density 1.50 against
+Qwen3.6's +39.9pp at 1.91, which does put Qwen3.6 ahead, by something closer to
+2.7× than to the gap the raw figures imply.
+
+And the excess is still climbing at the end of the trace (+24.6 → +33.3 →
++39.9), so it has not converged: **this trace is too short to quote a settled
+number at all.** A longer mixed-domain trace, and re-derived GLM and OLMoE
+numbers at matched density, are needed before any cross-model claim.
 
 ### What is left, stated as a hypothesis and not a result
 
