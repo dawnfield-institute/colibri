@@ -59,6 +59,7 @@ static int qwen36_max_ctx(void) {
 #endif
 #include "st.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
+#include "route_trace.h"   /* ROUTE_TRACE stream + .coli_usage history; see model_init */
 #include "qwen36_tier.h"   /* optional transparent Vulkan compute backend for MoE experts */
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
@@ -617,7 +618,7 @@ typedef struct {
     float *attn_sc;            /* [attn_sc_thr * kv_cap] score rows, one per thread */
     int attn_sc_thr;
     double dense_load_s;
-    uint32_t *freq;
+    uint32_t **freq;                   /* per-layer expert counts, owned by route_trace.h */
     int freq_token_count, hot_pinned, hot_n, warmup_tokens, token_count;
     float *momentum_logits;
     float pilot_smooth, pilot_conf_limit;
@@ -1327,7 +1328,19 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->DN_rec[i]  = calloc((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, sizeof(float));
         m->DN_conv[i] = calloc((size_t)c->dn_conv_dim * (c->dn_convk - 1), sizeof(float));
     }
-    m->freq = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint32_t));
+    /* Routing telemetry, on the same terms as every other engine. qwen36 already
+     * counted expert selections for its own HOT pinning, in a private flat array that
+     * nothing else could read or persist; route_trace.h owns the same counters in
+     * per-layer rows, so handing them over costs one indirection at the read sites and
+     * buys the whole shared surface: the ROUTE_TRACE stream, the .coli_usage history
+     * that survives a run, PIN=auto placement from it, and COLI_USAGE_DECAY. */
+    rt_init("qwen36", c->n_layers, c->n_experts);
+    m->freq = rt_counts_all();
+    { const char *up = getenv("COLI_USAGE");    /* optional history seed */
+      if (up && *up) {
+          int64_t h = rt_load(up);
+          if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n",
+                             (long long)h, up); } }
     m->hot_pinned = 0; m->freq_token_count = 0;
     m->hot_n         = getenv("HOT")    ? atoi(getenv("HOT"))    : 0;
     m->warmup_tokens = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 5;
@@ -1542,7 +1555,8 @@ static void pin_hot_experts(Model *m) {
     double thresh = is_dynamic ? (double)m->hot_n / 1000.0 : 0.0;
     int pinned_total = 0;
     for (int l = 0; l < c->n_layers; l++) {
-        uint32_t *freq_l = m->freq + (int64_t)l * c->n_experts;
+        uint32_t *freq_l = m->freq ? m->freq[l] : NULL;
+        if (!freq_l) continue;
         uint64_t layer_total = 0;
         for (int e = 0; e < c->n_experts; e++) layer_total += freq_l[e];
         if (layer_total == 0) continue;
@@ -1846,9 +1860,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
         /* HF renormalizes the top-k router weights unconditionally */
         { float sm=0; for (int kk=0;kk<K;kk++) sm+=val[kk]; if (sm>0) for (int kk=0;kk<K;kk++) val[kk]/=sm; }
+        /* ROUTE_TRACE: after HF's unconditional top-k renormalisation above, so the
+         * gates on the line are the ones the layer applies. Inert unless set. */
+        rt_trace(layer, s, idx, val, K);
         if (!m->hot_pinned && m->freq) {
-            uint32_t *freq_l = m->freq + (int64_t)layer * E;
-            for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
+            uint32_t *freq_l = m->freq[layer];
+            if (freq_l) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
         const float *xs = x + (int64_t)s*D;
         if (use_qt) {
@@ -1916,6 +1933,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * resident GPU experts.  CPU prefill instead traverses each shared matrix
      * once per bounded chunk. */
     if (!use_qt) qwen_shared_experts_cpu(m,l,x,S,out,sh,shu,shd);
+    rt_trace_end();          /* advance the call counter once per moe(), after its rows */
     free(logits); free(g); free(u); free(hh); free(sh); free(shu); free(shd);
 }
 
@@ -2705,7 +2723,10 @@ int main(int argc, char **argv) {
         printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
-        free(buf); free(arena); return 0;
+        free(buf); free(arena);
+        return 0;      /* PPL is a measurement run: no rt_save on purpose, so a loss
+                        * sweep cannot fold its own tokens into the persisted ranking
+                        * (same contract as olmoe.c) */
     }
 
     out = malloc((np + n_new) * sizeof(int));
@@ -2770,6 +2791,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
+    { const char *up = getenv("COLI_USAGE");
+      if (up && *up) rt_save(up, 0); }              /* same bytes as every other engine */
     free(buf); free(arena);
     /* Oracle mode is a gate, not a report: a mismatch must fail the caller.
      * inkling.c does the same (`return (match == ngen) ? 0 : 1;`) and its CI
@@ -2823,7 +2846,7 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
     }
     free(model->attn_sc);
     free(model->seen); free(model->is_queued); free(model->is_pinned);
-    free(model->momentum_logits); free(model->freq);
+    free(model->momentum_logits);   /* freq rows belong to route_trace.h, not to us */
     free(model->DN_conv); free(model->DN_rec);
     free(model->cache); free(model->active_of); free(model->L);
     free(model->c.is_attn);
