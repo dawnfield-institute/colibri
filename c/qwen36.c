@@ -1416,11 +1416,27 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         uint8_t *raw = (uint8_t *)malloc((size_t)(want_w / 2));
         if (!raw) { fprintf(stderr, "OOM reading int4 expert %s\n", nm); exit(1); }
         st_read_raw(&m->S, nm, raw, 1);
-        for (int64_t i = 0; i < want_w; i++) {
-            uint8_t byte = raw[i >> 1];
-            int8_t v = (int8_t)((i & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF));
-            if (v & 8) v -= 16;                 /* sign-extend signed 4-bit */
-            s->g[i] = v;
+        /* Walk BYTES, not elements, and sign-extend by shifting rather than by
+         * branching. The element-indexed form below cost one `raw[i>>1]` reload, one
+         * `i & 1` select and one unpredictable branch for every one of the 6.29M
+         * values in an expert, and no compiler vectorises through that. Each miss
+         * pays this loop in full, and on Qwen3.6 a miss measured 2.62 ms against
+         * 11.1 s of fixed decode -- about 60% of decode time was here.
+         *
+         *     (int8_t)(b << 4) >> 4   low nibble, sign-extended
+         *     (int8_t)(b & 0xF0) >> 4 high nibble, sign-extended
+         *
+         * Casting to int8_t puts the nibble in the top 4 bits; the arithmetic right
+         * shift then replicates bit 3 exactly as the `v & 8 ? v - 16 : v` did. Two
+         * stores per iteration, sequential in both streams, which auto-vectorises on
+         * AVX2 and NEON alike. Bit-identical to the loop it replaces -- the nibble
+         * convention (LOW = element 2k, HIGH = 2k+1) is unchanged and still matches
+         * pack_int4 in c/tools/convert_qwen36.py. */
+        const int64_t nbytes_i4 = want_w / 2;
+        for (int64_t b = 0; b < nbytes_i4; b++) {
+            uint8_t byte = raw[b];
+            s->g[2*b]     = (int8_t)(byte << 4) >> 4;
+            s->g[2*b + 1] = (int8_t)(byte & 0xF0) >> 4;
         }
         s->is_int4 = 1;
         /* Free any previous occupant first (LRU slot reuse). */
