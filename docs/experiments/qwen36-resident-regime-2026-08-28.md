@@ -114,10 +114,28 @@ working set churns faster than LRU adapts, or when a miss is expensive enough
 that a slightly better hit rate outweighs lost adaptivity. July's GLM box was the
 second case — misses cost NVMe reads. Here they cost a memcpy.
 
-That is a hypothesis with an obvious test (vary miss cost by forcing the
-container out of page cache, and vary workload churn with a rotating prompt mix),
-and it has not been run. What is measured above is the null and the skew; the
-explanation is not yet earned.
+That is a hypothesis with an obvious test, and the first attempt at it failed in a
+way worth recording.
+
+**Squeezing the page cache does not vary miss cost here, and a null from it proves
+nothing.** Capping the cgroup from `MemoryMax=40G` down to `15G` against a 22 GB
+container left decode flat (`-0.015 ms/miss`), which looked like evidence that the
+per-miss cost was CPU rather than I/O. It is not evidence of that. Bracketing the
+runs against `/proc/diskstats` shows **9.49 GB of device reads per run at every
+memory level, identical to two decimals** — the cap never produced a differential,
+because even 40G could not hold a 22 GB container plus ~12 GB of anonymous memory.
+All three rungs were equally uncached, so the comparison had no contrast in it. And
+the 9.49 GB is essentially the one-time dense-weight load (~9.25 GB resident)
+rather than expert-miss traffic.
+
+The conclusion the failed experiment was reaching for happens to be true, but it is
+established by something else entirely: vectorising the integer int4 unpack
+produced a 2.10x end-to-end speedup, which is impossible on a storage-bound
+workload. At 5.78 GB/s the 9.49 GB of reads is ~1.6 s of a 28.4 s decode, under 6%.
+
+A real test of the miss-cost hypothesis needs miss cost varied by a mechanism that
+actually changes device traffic — a container genuinely larger than RAM, or forced
+`O_DIRECT` reads — not by a memory cap that every rung already exceeds.
 
 ## Caveats
 
